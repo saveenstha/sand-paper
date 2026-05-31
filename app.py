@@ -136,16 +136,46 @@ SIM_HTML = f"""<!DOCTYPE html>
 <head>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: transparent; font-family: -apple-system, sans-serif; }}
+
+  html, body {{
+    width: 100%;
+    background: transparent;
+    font-family: -apple-system, sans-serif;
+    /* never let the body itself scroll — height is reported to parent */
+    overflow: hidden;
+  }}
+
+  #layout {{
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    gap: 10px;
+    padding-bottom: 4px;   /* tiny breathing room at bottom */
+  }}
+
   #wrap {{
+    width: 100%;
     background: #f0e8d8;
     border-radius: 12px;
     overflow: hidden;
     border: 1px solid rgba(0,0,0,0.12);
     box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+    /* height is set dynamically by JS to maintain aspect ratio */
   }}
-  canvas {{ display: block; width: 100%; image-rendering: pixelated; }}
-  .btns {{ display: flex; gap: 8px; margin-top: 10px; }}
+
+  canvas {{
+    display: block;
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+  }}
+
+  .btns {{
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;   /* buttons must never be compressed or hidden */
+  }}
+
   .btn-run {{
     flex: 1; padding: 10px;
     background: linear-gradient(135deg, #2bb87a, #1a8f5e);
@@ -155,55 +185,69 @@ SIM_HTML = f"""<!DOCTYPE html>
     box-shadow: 0 2px 6px rgba(27,143,94,0.35);
   }}
   .btn-run:hover {{ background: linear-gradient(135deg, #25a56e, #167a51); }}
+
   .btn-reset {{
     padding: 10px 18px;
     background: #ede8df; border: 1px solid #c8bfb0;
     border-radius: 8px; font-size: 14px; cursor: pointer; color: #5a4a38;
+    flex-shrink: 0;
   }}
   .btn-reset:hover {{ background: #e2dcd2; }}
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c"></canvas></div>
-<div class="btns">
-  <button class="btn-run" onclick="runSim()">▶ Run simulation</button>
-  <button class="btn-reset" onclick="resetSim()">↺ Reset</button>
+<div id="layout">
+  <div id="wrap"><canvas id="c"></canvas></div>
+  <div class="btns">
+    <button class="btn-run" onclick="runSim()">▶ Run simulation</button>
+    <button class="btn-reset" onclick="resetSim()">↺ Reset</button>
+  </div>
 </div>
 
 <script>
-// ── Canvas setup — actual pixel size drives all physics coords ────────────
+// ── Canvas / layout resize ────────────────────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
-const ASPECT = 720 / 340;  // fixed aspect ratio
+const ASPECT = 720 / 340;
 
-let W = 720, H = 340;      // logical size — updated on every resize
+let W = 720, H = 340;
+
+function reportHeight() {{
+  // Tell Streamlit the true height of our content so the iframe never clips
+  const layout = document.getElementById('layout');
+  const totalH = layout.getBoundingClientRect().height || layout.offsetHeight;
+  window.parent.postMessage({{
+    type: 'streamlit:setFrameHeight',
+    height: Math.ceil(totalH) + 8,
+  }}, '*');
+}}
 
 function resizeCanvas() {{
-  const wrap    = document.getElementById('wrap');
-  const cssW    = wrap.clientWidth  || 720;
-  const cssH    = Math.round(cssW / ASPECT);
-  const dpr     = window.devicePixelRatio || 1;
+  const wrap = document.getElementById('wrap');
+  const cssW = wrap.clientWidth || 720;
+  const cssH = Math.round(cssW / ASPECT);
+  const dpr  = window.devicePixelRatio || 1;
 
-  // Physical backing pixels
+  // Drive wrap height so canvas fills it at the correct aspect ratio
+  wrap.style.height = cssH + 'px';
+
+  // Physical backing pixels (sharp on retina)
   canvas.width  = Math.round(cssW * dpr);
   canvas.height = Math.round(cssH * dpr);
 
-  // CSS display size
-  canvas.style.width  = cssW  + 'px';
-  canvas.style.height = cssH  + 'px';
+  canvas.style.width  = cssW + 'px';
+  canvas.style.height = cssH + 'px';
 
-  // Scale all canvas drawing to match DPR
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-  // Update logical dimensions used by physics
   W = cssW;
   H = cssH;
 
-  // Rebuild spatial grid whenever dimensions change
   rebuildGridDims();
-
-  // Invalidate gradient cache (depends on W/H)
   grainGrad = null;
+
+  // Always let Streamlit know the new total height
+  reportHeight();
 }}
 
 const PARTICLE_R = 5;
@@ -661,27 +705,29 @@ function resetSim() {{
 }}
 
 // ── Resize handling ───────────────────────────────────────────────────────
-// ResizeObserver fires whenever the iframe/wrap changes size (incl. fullscreen)
 const ro = new ResizeObserver(() => {{
   resizeCanvas();
   if (!running) drawStatic();
+  reportHeight();
 }});
-ro.observe(document.getElementById('wrap'));
+// Observe the outer layout div so button height changes are caught too
+ro.observe(document.getElementById('layout'));
 
-// Also catch explicit fullscreen changes
 document.addEventListener('fullscreenchange', () => {{
   resizeCanvas();
   if (!running) drawStatic();
+  reportHeight();
 }});
 
 // Initial paint
 resizeCanvas();
 drawStatic();
+reportHeight();
 </script>
 </body>
 </html>"""
 
-components.html(SIM_HTML, height=430, scrolling=False)
+components.html(SIM_HTML, height=500, scrolling=False)
 
 # ── Yield surface ─────────────────────────────────────────────────────────────
 st.markdown("### Mohr-Coulomb yield surface")
