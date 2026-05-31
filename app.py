@@ -95,7 +95,7 @@ with st.sidebar:
         "scenario",
         options=["flow", "castle", "bridge"],
         format_func=lambda s: {
-            "flow": "⏳ Hourglass flow",
+            "flow":   "⏳ Hourglass flow",
             "castle": "🏰 Castle stability",
             "bridge": "🌉 Bridge arch",
         }[s],
@@ -103,17 +103,13 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.caption(
-        "Based on: *Rigid Body Simulation of Cohesive Granular Materials*, "
-        "ACM SIGGRAPH 2025"
+    st.markdown(
+        "<small>Based on: *Rigid Body Simulation of Cohesive Granular Materials*, ACM SIGGRAPH 2025</small>",
+        unsafe_allow_html=True,
     )
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title("What shape is your sand?")
-st.caption(
-    "Grain shape alone controls how sand flows, holds together, or locks up. "
-    "Pick a grain and scenario in the sidebar, then run the simulation."
-)
 
 # ── Property cards ────────────────────────────────────────────────────────────
 c1, c2, c3 = st.columns(3)
@@ -128,13 +124,12 @@ with c3:
     st.progress(grain["jam"])
 
 st.info(
-    f"**{grain['name']} — {scenario} behavior:** "
+    f"**{grain['name']} — {scenario}:** "
     f"{SCENARIO_BEHAVIOR[scenario][grain_id]}"
 )
 
-# ── Simulation (HTML5 canvas embedded via components.html) ────────────────────
+# ── Simulation ────────────────────────────────────────────────────────────────
 st.markdown("### Simulation")
-st.caption("The physics engine runs entirely in your browser via an embedded canvas component.")
 
 SIM_HTML = f"""<!DOCTYPE html>
 <html>
@@ -142,194 +137,491 @@ SIM_HTML = f"""<!DOCTYPE html>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ background: transparent; font-family: -apple-system, sans-serif; }}
-  #wrap {{ background: #f5efe6; border-radius: 10px; overflow: hidden; border: 1px solid rgba(0,0,0,0.1); }}
-  canvas {{ display: block; width: 100%; }}
+  #wrap {{
+    background: #f0e8d8;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(0,0,0,0.12);
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  }}
+  canvas {{ display: block; width: 100%; image-rendering: pixelated; }}
   .btns {{ display: flex; gap: 8px; margin-top: 10px; }}
-  .btn-run {{ flex: 1; padding: 9px; background: #1D9E75; color: white; border: none;
-              border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; }}
-  .btn-run:hover {{ background: #18876a; }}
-  .btn-reset {{ padding: 9px 16px; background: #f0ede6; border: 1px solid #ccc;
-                border-radius: 8px; font-size: 14px; cursor: pointer; }}
-  .btn-reset:hover {{ background: #e4e0d8; }}
+  .btn-run {{
+    flex: 1; padding: 10px;
+    background: linear-gradient(135deg, #2bb87a, #1a8f5e);
+    color: white; border: none; border-radius: 8px;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+    letter-spacing: 0.02em;
+    box-shadow: 0 2px 6px rgba(27,143,94,0.35);
+  }}
+  .btn-run:hover {{ background: linear-gradient(135deg, #25a56e, #167a51); }}
+  .btn-reset {{
+    padding: 10px 18px;
+    background: #ede8df; border: 1px solid #c8bfb0;
+    border-radius: 8px; font-size: 14px; cursor: pointer; color: #5a4a38;
+  }}
+  .btn-reset:hover {{ background: #e2dcd2; }}
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c" width="700" height="320"></canvas></div>
+<div id="wrap"><canvas id="c" width="720" height="340"></canvas></div>
 <div class="btns">
   <button class="btn-run" onclick="runSim()">▶ Run simulation</button>
   <button class="btn-reset" onclick="resetSim()">↺ Reset</button>
 </div>
+
 <script>
-const W = 700, H = 320;
+const W = 720, H = 340;
+const PARTICLE_R = 5;
+const SUBSTEPS = 4;          // sub-steps per frame for stability
+const MAX_PARTICLES = 260;
+
+// Grain properties from paper
 const G = {{
-  friction: {grain["friction_angle"]},
-  cohesion: {grain["cohesion"]},
-  jam: {grain["jam"]},
-  color: "{grain["color"]}",
-  darkColor: "{grain["dark_color"]}"
+  frictionAngle: {grain["friction_angle"]},   // degrees
+  cohesion:      {grain["cohesion"]},          // kPa
+  jam:           {grain["jam"]},               // 0-100
+  color:         "{grain["color"]}",
+  darkColor:     "{grain["dark_color"]}",
 }};
+
 const SCENE = "{scenario}";
 
+// Derived physics constants
+const phi       = G.frictionAngle * Math.PI / 180;
+const MU        = Math.tan(phi);                      // friction coefficient
+const COH       = G.cohesion * 0.006;                 // cohesion force scale
+const RESTITUTION = Math.max(0.02, 0.18 - MU * 0.14);// bounciness drops with friction
+const DAMP_AIR  = 1.0 - (0.008 + MU * 0.012);        // air damping per frame
+const GRAVITY   = 0.38 / SUBSTEPS;
+const FLOW_RATE = 1.0 - G.jam / 118;
+const NECK_HALF = 16 + (1 - FLOW_RATE) * 26;         // hourglass neck width
+
 const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
-let pts = [], raf = null, t = 0;
+const ctx    = canvas.getContext('2d');
+
+// ── Spatial hash grid for broadphase collision ────────────────────────────
+const CELL  = PARTICLE_R * 2.2;
+const COLS  = Math.ceil(W / CELL) + 1;
+const ROWS  = Math.ceil(H / CELL) + 1;
+let grid    = new Array(COLS * ROWS);
+
+function gridKey(x, y) {{
+  return (Math.floor(x / CELL) | 0) + (Math.floor(y / CELL) | 0) * COLS;
+}}
+
+function buildGrid(pts) {{
+  grid.fill(null);
+  for (let i = 0; i < pts.length; i++) {{
+    const k = gridKey(pts[i].x, pts[i].y);
+    pts[i].next = grid[k];
+    grid[k] = i;
+  }}
+}}
+
+function* neighbors(pts, x, y) {{
+  const cx = Math.floor(x / CELL) | 0;
+  const cy = Math.floor(y / CELL) | 0;
+  for (let dx = -1; dx <= 1; dx++) {{
+    for (let dy = -1; dy <= 1; dy++) {{
+      const nx = cx + dx, ny2 = cy + dy;
+      if (nx < 0 || nx >= COLS || ny2 < 0 || ny2 >= ROWS) continue;
+      let idx = grid[nx + ny2 * COLS];
+      while (idx !== null && idx !== undefined) {{
+        yield idx;
+        idx = pts[idx].next;
+      }}
+    }}
+  }}
+}}
+
+// ── Particle pool ─────────────────────────────────────────────────────────
+let pts = [], raf = null, simTime = 0, running = false;
+
+function mkPt(x, y) {{
+  return {{ x, y, px: x, py: y, next: null }};  // px/py = previous position (Verlet)
+}}
 
 function rnd(a, b) {{ return a + Math.random() * (b - a); }}
 
 function init() {{
   pts = [];
-  const r = 5;
   if (SCENE === 'flow') {{
-    for (let i = 0; i < 210; i++)
-      pts.push({{ x: rnd(W/2-88, W/2+88), y: rnd(16, 132), vx: 0, vy: 0, r }});
-  }} else if (SCENE === 'castle') {{
-    for (let i = 0; i < 290; i++) {{
-      const sp = Math.max(18, 172 - i * 0.44);
-      pts.push({{ x: rnd(W/2-sp/2, W/2+sp/2), y: H-54 - i*0.65 + rnd(0,6), vx: 0, vy: 0, r }});
+    const count = Math.min(MAX_PARTICLES, 210);
+    for (let i = 0; i < count; i++) {{
+      const x = rnd(W/2 - 86, W/2 + 86);
+      const y = rnd(14 + (i / count) * 110, 26 + (i / count) * 120);
+      pts.push(mkPt(x, y));
     }}
-  }} else {{
-    for (let i = 0; i < 270; i++) {{
-      const left = i < 135, cx = left ? W/2-80 : W/2+80;
-      pts.push({{ x: rnd(cx-56, cx+56), y: rnd(52, H-54), vx: 0, vy: 0, r }});
+  }} else if (SCENE === 'castle') {{
+    for (let i = 0; i < MAX_PARTICLES; i++) {{
+      const t = i / MAX_PARTICLES;
+      const spread = Math.max(16, 164 - i * 0.42);
+      const x = rnd(W/2 - spread/2, W/2 + spread/2);
+      const y = H - 48 - i * 0.62 + rnd(0, 5);
+      pts.push(mkPt(x, y));
+    }}
+  }} else {{ // bridge
+    for (let i = 0; i < MAX_PARTICLES; i++) {{
+      const left = i < MAX_PARTICLES / 2;
+      const cx = left ? W/2 - 82 : W/2 + 82;
+      pts.push(mkPt(rnd(cx - 58, cx + 58), rnd(48, H - 56)));
     }}
   }}
 }}
 
-function step() {{
-  const fr = G.friction / 100, co = G.cohesion / 10;
-  const damp = 0.55 + fr * 0.3;
-  const flowRate = 1.0 - G.jam / 115, nH = 18 + (1 - flowRate) * 22;
+// ── Verlet integration step ───────────────────────────────────────────────
+function verletStep(impactActive) {{
+  const dt = 1.0 / SUBSTEPS;
 
   for (const p of pts) {{
-    p.vy += 0.26;
-    if (SCENE === 'flow') {{
-      if (p.y > 148 && p.y < 214) {{
-        const d = Math.abs(p.x - W/2);
-        if (d < nH + 4) {{
-          if (Math.random() < (G.jam/100)*0.15) {{ p.vx *= 0.3; p.vy *= 0.1; }}
-          else p.vx += (p.x < W/2 ? -1 : 1) * 0.3;
-        }}
+    const vx = (p.x - p.px) * DAMP_AIR;
+    const vy = (p.y - p.py) * DAMP_AIR;
+
+    // Scenario forces
+    let fx = 0, fy = GRAVITY;
+
+    if (SCENE === 'castle' && impactActive) {{
+      const strength = (1 - G.cohesion / 12) * 0.55;
+      const dx = p.x - W/2, dy = p.y - (H - 95);
+      const d  = Math.sqrt(dx*dx + dy*dy);
+      if (d < 80 && d > 0.1) {{
+        fx += (dx/d) * strength * (1 - d/80);
+        fy += (dy/d) * strength * (1 - d/80) - 0.2;
       }}
-      if (p.y > H-38) {{ p.y = H-38; p.vy *= -0.1; p.vx *= damp; }}
     }}
-    if (SCENE === 'castle') {{
-      if (t > 80 && t < 148) {{
-        const f = (1 - co*0.6)*0.85;
-        if (Math.abs(p.x-W/2) < 66 && p.y > H-172)
-          {{ p.vx += (Math.random()-0.5)*f; p.vy -= Math.random()*f*0.5; }}
-      }}
-      if (p.y > H-38) {{ p.y=H-38; p.vy *= -(0.05+co*0.1); p.vx *= damp+co*0.2; }}
+
+    if (SCENE === 'bridge' && simTime > 110) {{
+      const archHold = MU * (1 + COH * 8);
+      fy += Math.max(0, 0.28 - archHold * 0.22);
     }}
-    if (SCENE === 'bridge') {{
-      if (t > 100) p.vy += Math.max(0, 0.008-(co*fr)*0.001)*2;
-      if (p.y > H-38) {{ p.y=H-38; p.vy *= -0.05; p.vx *= damp; }}
-      const gap = 84;
-      if (p.x > W/2-gap/2 && p.x < W/2+gap/2 && p.y > H-120)
-        {{ if (co < 3) p.vy += 0.4; else {{ p.vy *= 0.3; p.vx *= 0.3; }} }}
-    }}
+
+    p.px = p.x;
+    p.py = p.y;
+    p.x  = p.x + vx + fx;
+    p.y  = p.y + vy + fy;
   }}
+}}
+
+// ── Collision resolution ──────────────────────────────────────────────────
+function resolveCollisions() {{
+  buildGrid(pts);
+  const diam = PARTICLE_R * 2;
+  const seen = new Set();
 
   for (let i = 0; i < pts.length; i++) {{
-    for (let j = i+1; j < pts.length; j++) {{
-      const p = pts[i], q = pts[j];
-      const dx=q.x-p.x, dy=q.y-p.y, d2=dx*dx+dy*dy, mD=p.r+q.r;
-      if (d2 < mD*mD && d2 > 0.01) {{
-        const d=Math.sqrt(d2), nx=dx/d, ny=dy/d, ov=(mD-d)*0.4;
-        p.x-=nx*ov; p.y-=ny*ov; q.x+=nx*ov; q.y+=ny*ov;
-        const rv=(q.vx-p.vx)*nx+(q.vy-p.vy)*ny;
-        if (rv < 0) {{
-          const imp=rv*(0.3-Math.min(co*0.05,0.3));
-          p.vx-=imp*nx*0.5; p.vy-=imp*ny*0.5; q.vx+=imp*nx*0.5; q.vy+=imp*ny*0.5;
-        }}
-        const fd=1-fr*0.08;
-        p.vx*=fd; p.vy*=fd; q.vx*=fd; q.vy*=fd;
+    const p = pts[i];
+    for (const j of neighbors(pts, p.x, p.y)) {{
+      if (j <= i) continue;
+      const key = i * 10000 + j;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const q  = pts[j];
+      const dx = q.x - p.x, dy = q.y - p.y;
+      const d2 = dx*dx + dy*dy;
+      if (d2 >= diam*diam || d2 < 0.0001) continue;
+
+      const d      = Math.sqrt(d2);
+      const nx     = dx/d, ny = dy/d;
+      const overlap = (diam - d) * 0.5;
+
+      // Position correction (split evenly)
+      const corr = overlap * 0.52;
+      p.x -= nx * corr; p.y -= ny * corr;
+      q.x += nx * corr; q.y += ny * corr;
+
+      // Velocity-level response
+      const pvx = p.x - p.px, pvy = p.y - p.py;
+      const qvx = q.x - q.px, qvy = q.y - q.py;
+      const relVn = (qvx - pvx)*nx + (qvy - pvy)*ny;
+
+      if (relVn < 0) {{
+        // Normal impulse with restitution
+        const jn = -(1 + RESTITUTION) * relVn * 0.5;
+        const inx = jn * nx, iny = jn * ny;
+
+        // Tangential friction impulse
+        const tx = -(ny), ty = nx;
+        const relVt = (qvx - pvx)*tx + (qvy - pvy)*ty;
+        const jt = -relVt * MU * 0.28;
+        const itx = jt * tx, ity = jt * ty;
+
+        // Cohesion: small attractive pull when barely touching
+        const cohPull = COH * Math.max(0, 1 - d / (diam * 1.15));
+
+        p.px += inx + itx - nx * cohPull;
+        p.py += iny + ity - ny * cohPull;
+        q.px -= inx + itx + nx * cohPull;
+        q.py -= iny + ity + ny * cohPull;
       }}
     }}
   }}
+}}
 
-  const nH2 = 18+(1-(1-G.jam/115))*22;
+// ── Wall constraints ──────────────────────────────────────────────────────
+function applyWalls() {{
+  const R = PARTICLE_R;
+  const floorY = H - 36;
+
   for (const p of pts) {{
-    if (SCENE === 'flow') {{
-      const wl=W/2-108-(p.y/H)*38, wr=W/2+108+(p.y/H)*38;
-      const inN=p.y>148&&p.y<214;
-      const lb=inN?W/2-nH2:wl, rb=inN?W/2+nH2:wr;
-      if(p.x<lb){{p.x=lb;p.vx=Math.abs(p.vx)*0.3;}}
-      if(p.x>rb){{p.x=rb;p.vx=-Math.abs(p.vx)*0.3;}}
-    }} else if (SCENE==='bridge') {{
-      if(p.x<58){{p.x=58;p.vx=Math.abs(p.vx)*0.3;}}
-      if(p.x>W-58){{p.x=W-58;p.vx=-Math.abs(p.vx)*0.3;}}
-    }} else {{
-      if(p.x<18){{p.x=18;p.vx=Math.abs(p.vx)*0.3;}}
-      if(p.x>W-18){{p.x=W-18;p.vx=-Math.abs(p.vx)*0.3;}}
+    const vx = p.x - p.px, vy = p.y - p.py;
+
+    // Floor
+    if (p.y > floorY - R) {{
+      p.y  = floorY - R;
+      p.py = p.y + vy * RESTITUTION;
+      p.px = p.x - vx * (1 - MU * 0.35);
     }}
-    p.x+=p.vx; p.y+=p.vy;
-    if(p.y<0){{p.y=0;p.vy=Math.abs(p.vy)*0.3;}}
+
+    // Ceiling
+    if (p.y < R) {{ p.y = R; p.py = p.y + vy * RESTITUTION; }}
+
+    if (SCENE === 'flow') {{
+      // Hourglass walls (linear taper above neck, straight below)
+      const neckY  = H * 0.53;
+      const taper  = Math.max(0, (neckY - p.y) / neckY);
+      const wallW  = NECK_HALF + taper * 96;
+      const leftW  = W/2 - wallW;
+      const rightW = W/2 + wallW;
+
+      if (p.x < leftW + R) {{
+        p.x  = leftW + R;
+        p.px = p.x + vx * RESTITUTION;
+        p.py = p.y - vy * MU * 0.2;
+      }}
+      if (p.x > rightW - R) {{
+        p.x  = rightW - R;
+        p.px = p.x + vx * RESTITUTION;
+        p.py = p.y - vy * MU * 0.2;
+      }}
+
+      // Hourglass jam logic: probabilistic block at neck
+      if (Math.abs(p.x - W/2) < NECK_HALF + R && p.y > neckY - 12 && p.y < neckY + 12) {{
+        const jamProb = G.jam / 100 * 0.12;
+        if (Math.random() < jamProb) {{
+          p.x  = p.px;
+          p.px = p.x + (rnd(-0.4, 0.4));
+          p.py = p.y;
+        }}
+      }}
+
+    }} else if (SCENE === 'bridge') {{
+      const pillarW = 56;
+      if (p.x < pillarW + R) {{
+        p.x  = pillarW + R;
+        p.px = p.x + vx * RESTITUTION;
+      }}
+      if (p.x > W - pillarW - R) {{
+        p.x  = W - pillarW - R;
+        p.px = p.x + vx * RESTITUTION;
+      }}
+
+      // Gap floor — no floor in the gap if cohesive enough
+      const gap = 90;
+      const inGap = p.x > W/2 - gap/2 && p.x < W/2 + gap/2;
+      if (inGap && p.y > floorY - R) {{
+        const holdStrength = MU * (1 + COH * 6);
+        if (holdStrength < 0.55) {{
+          // falls through
+        }} else {{
+          p.y  = floorY - R;
+          p.py = p.y + vy * RESTITUTION * 0.3;
+        }}
+      }}
+
+    }} else {{ // castle
+      if (p.x < R) {{ p.x = R; p.px = p.x + vx * RESTITUTION; }}
+      if (p.x > W - R) {{ p.x = W - R; p.px = p.x + vx * RESTITUTION; }}
+    }}
   }}
 }}
 
-function drawBg() {{
-  ctx.fillStyle='#f5efe6'; ctx.fillRect(0,0,W,H);
-  ctx.fillStyle='#d4c4a8'; ctx.strokeStyle='#9a8060'; ctx.lineWidth=1.5;
-  const nH=18+(1-(1-G.jam/115))*22;
-  if (SCENE==='flow') {{
-    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(W/2-108,0); ctx.lineTo(W/2-nH,183); ctx.lineTo(W/2-nH,H); ctx.lineTo(0,H); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(W,0); ctx.lineTo(W/2+108,0); ctx.lineTo(W/2+nH,183); ctx.lineTo(W/2+nH,H); ctx.lineTo(W,H); ctx.fill();
-    [[W/2-108,0,W/2-nH,183],[W/2+108,0,W/2+nH,183],[W/2-nH,183,W/2-nH,H],[W/2+nH,183,W/2+nH,H]]
-      .forEach(([x1,y1,x2,y2])=>{{ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();}});
-  }} else if (SCENE==='bridge') {{
-    ctx.fillRect(0,0,58,H-38); ctx.fillRect(W-58,0,58,H-38); ctx.fillRect(0,H-38,W,38);
-    ctx.strokeRect(0,0,58,H-38); ctx.strokeRect(W-58,0,58,H-38); ctx.strokeRect(0,H-38,W,38);
-  }} else {{
-    ctx.fillRect(0,H-38,W,38);
-    ctx.beginPath(); ctx.moveTo(0,H-38); ctx.lineTo(W,H-38); ctx.stroke();
+// ── Rendering ─────────────────────────────────────────────────────────────
+// Pre-build a radial gradient template for grain shading
+let grainGrad = null;
+function getGrainGrad(r) {{
+  if (grainGrad) return grainGrad;
+  const og = ctx.createRadialGradient(-r*0.3, -r*0.3, r*0.05, 0, 0, r);
+  og.addColorStop(0, lighten(G.color, 0.28));
+  og.addColorStop(0.5, G.color);
+  og.addColorStop(1, G.darkColor);
+  grainGrad = og;
+  return og;
+}}
+
+function lighten(hex, amt) {{
+  const r = parseInt(hex.slice(1,3),16), g2 = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  const lr = Math.min(255, r + (255-r)*amt)|0;
+  const lg = Math.min(255, g2 + (255-g2)*amt)|0;
+  const lb = Math.min(255, b + (255-b)*amt)|0;
+  return `rgb(${{lr}},${{lg}},${{lb}})`;
+}}
+
+function drawBackground() {{
+  // Sandy base
+  const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+  bgGrad.addColorStop(0, '#ede3d0');
+  bgGrad.addColorStop(1, '#e0d4be');
+  ctx.fillStyle = bgGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle   = '#c8b898';
+  ctx.strokeStyle = '#a89878';
+  ctx.lineWidth   = 1.5;
+
+  if (SCENE === 'flow') {{
+    const nY = H * 0.53;
+    // Left wall
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(W/2 - NECK_HALF - 96, 0);
+    ctx.lineTo(W/2 - NECK_HALF, nY);
+    ctx.lineTo(W/2 - NECK_HALF, H);
+    ctx.lineTo(0, H);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // Right wall
+    ctx.beginPath();
+    ctx.moveTo(W, 0);
+    ctx.lineTo(W/2 + NECK_HALF + 96, 0);
+    ctx.lineTo(W/2 + NECK_HALF, nY);
+    ctx.lineTo(W/2 + NECK_HALF, H);
+    ctx.lineTo(W, H);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+
+  }} else if (SCENE === 'bridge') {{
+    const pillarW = 56, archH = 50;
+    // Left pillar
+    ctx.beginPath();
+    ctx.moveTo(0, 0); ctx.lineTo(pillarW, 0);
+    ctx.lineTo(pillarW, H - 36 - archH);
+    ctx.quadraticCurveTo(pillarW, H-36, pillarW + archH*0.6, H-36);
+    ctx.lineTo(0, H-36); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // Right pillar
+    ctx.beginPath();
+    ctx.moveTo(W, 0); ctx.lineTo(W - pillarW, 0);
+    ctx.lineTo(W - pillarW, H - 36 - archH);
+    ctx.quadraticCurveTo(W - pillarW, H-36, W - pillarW - archH*0.6, H-36);
+    ctx.lineTo(W, H-36); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // Floor (outside gap)
+    ctx.fillRect(0, H - 36, pillarW + 56, 36);
+    ctx.fillRect(W - pillarW - 56, H - 36, pillarW + 56, 36);
+    ctx.strokeRect(0, H - 36, W, 36);
+
+  }} else {{ // castle — flat ground
+    ctx.fillRect(0, H - 36, W, 36);
+    ctx.beginPath(); ctx.moveTo(0, H-36); ctx.lineTo(W, H-36); ctx.stroke();
   }}
 }}
 
 function drawParticles() {{
+  const r = PARTICLE_R;
+  const grad = getGrainGrad(r);
+
   for (const p of pts) {{
-    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
-    ctx.fillStyle=G.color; ctx.fill();
-    ctx.strokeStyle=G.darkColor; ctx.lineWidth=0.5; ctx.stroke();
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.strokeStyle = G.darkColor;
+    ctx.lineWidth = 0.6;
+    ctx.stroke();
+    ctx.restore();
   }}
 }}
 
 function drawStatic() {{
-  drawBg();
-  ctx.fillStyle=G.color;
-  if(SCENE==='flow'){{
-    for(let i=0;i<78;i++){{ctx.beginPath();ctx.arc(rnd(W/2-85,W/2+85),rnd(16,138),5,0,Math.PI*2);ctx.fill();}}
-  }}else if(SCENE==='bridge'){{
-    for(let i=0;i<92;i++){{
-      const left=i<46,cx=left?W/2-78:W/2+78;
-      ctx.beginPath();ctx.arc(rnd(cx-52,cx+52),rnd(36,H-54),5,0,Math.PI*2);ctx.fill();
+  drawBackground();
+  // Draw a settled pile preview
+  ctx.fillStyle = G.color;
+  ctx.strokeStyle = G.darkColor;
+  ctx.lineWidth = 0.5;
+
+  function dot(x, y) {{
+    ctx.save(); ctx.translate(x, y);
+    ctx.beginPath(); ctx.arc(0, 0, PARTICLE_R, 0, Math.PI*2);
+    const g = getGrainGrad(PARTICLE_R);
+    ctx.fillStyle = g; ctx.fill(); ctx.strokeStyle = G.darkColor; ctx.stroke();
+    ctx.restore();
+  }}
+
+  if (SCENE === 'flow') {{
+    for (let i = 0; i < 72; i++)
+      dot(rnd(W/2-82, W/2+82), rnd(14, 138));
+  }} else if (SCENE === 'bridge') {{
+    for (let i = 0; i < 88; i++) {{
+      const left = i < 44, cx = left ? W/2-80 : W/2+80;
+      dot(rnd(cx-54, cx+54), rnd(36, H-54));
     }}
-  }}else{{
-    for(let i=0;i<190;i++){{
-      const a=Math.random()*Math.PI,r=Math.random()*(76+i*0.2);
-      const x=W/2+Math.cos(a)*r*1.2,y=H-38-Math.abs(Math.sin(a)*r)*0.7;
-      if(x>12&&x<W-12&&y>0&&y<H-38){{ctx.beginPath();ctx.arc(x,y,5,0,Math.PI*2);ctx.fill();}}
+  }} else {{
+    for (let i = 0; i < 180; i++) {{
+      const a = Math.random()*Math.PI, r2 = Math.random()*(72+i*0.22);
+      const x = W/2 + Math.cos(a)*r2*1.18;
+      const y = H-36 - Math.abs(Math.sin(a)*r2)*0.72;
+      if (x > 12 && x < W-12 && y > 0 && y < H-36) dot(x, y);
     }}
   }}
-  ctx.fillStyle='rgba(90,60,30,0.4)'; ctx.font='13px sans-serif';
-  ctx.textAlign='center'; ctx.fillText('Press Run simulation to animate',W/2,H/2); ctx.textAlign='left';
+
+  // Prompt overlay
+  ctx.fillStyle = 'rgba(255,248,235,0.72)';
+  ctx.beginPath();
+  ctx.roundRect(W/2 - 150, H/2 - 18, 300, 36, 8);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(80,55,25,0.75)';
+  ctx.font = '600 13px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Press  ▶ Run simulation  to animate', W/2, H/2 + 5);
+  ctx.textAlign = 'left';
 }}
 
+// ── Main loop ─────────────────────────────────────────────────────────────
 function runSim() {{
-  if(raf)cancelAnimationFrame(raf);
-  t=0; init();
-  (function loop(){{
-    t++; step(); drawBg();
-    if(SCENE==='castle'&&t>80&&t<148){{
-      ctx.fillStyle='rgba(200,80,40,0.18)';
-      ctx.beginPath();ctx.arc(W/2+Math.sin(t*0.3)*3,H-98,28,0,Math.PI*2);ctx.fill();
+  if (raf) cancelAnimationFrame(raf);
+  simTime = 0; running = true;
+  grainGrad = null; // reset gradient cache
+  init();
+
+  function loop() {{
+    simTime++;
+    const impactActive = SCENE === 'castle' && simTime > 72 && simTime < 142;
+
+    // Sub-stepping for stability
+    for (let s = 0; s < SUBSTEPS; s++) {{
+      verletStep(impactActive);
+      resolveCollisions();
+      applyWalls();
     }}
+
+    drawBackground();
+
+    // Impact ring
+    if (impactActive) {{
+      const phase = (simTime - 72) / 70;
+      const ringR = phase * 55;
+      ctx.strokeStyle = `rgba(210,90,30,${{(1-phase)*0.5}})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(W/2, H - 95, ringR, 0, Math.PI*2);
+      ctx.stroke();
+    }}
+
     drawParticles();
-    if(t<300)raf=requestAnimationFrame(loop);
-  }})();
+
+    if (simTime < 420) raf = requestAnimationFrame(loop);
+    else running = false;
+  }}
+  loop();
 }}
 
-function resetSim(){{
-  if(raf){{cancelAnimationFrame(raf);raf=null;}}
+function resetSim() {{
+  if (raf) {{ cancelAnimationFrame(raf); raf = null; }}
+  running = false;
   drawStatic();
 }}
 
@@ -338,12 +630,10 @@ drawStatic();
 </body>
 </html>"""
 
-components.html(SIM_HTML, height=410, scrolling=False)
+components.html(SIM_HTML, height=420, scrolling=False)
 
 # ── Yield surface ─────────────────────────────────────────────────────────────
-st.markdown("---")
 st.markdown("### Mohr-Coulomb yield surface")
-st.caption("τ = c + σ·tan(φ) — the failure boundary between stable and flowing material. Steeper slope = higher friction angle.")
 
 sigma = list(range(0, 151, 5))
 chart_data = {}
@@ -356,7 +646,7 @@ df.index.name = "Normal stress σ (kPa)"
 st.line_chart(df, height=280)
 
 # ── Grain comparison table ────────────────────────────────────────────────────
-with st.expander("Full grain properties (from paper)"):
+with st.expander("Full grain properties table"):
     rows = []
     for gid, g in GRAINS.items():
         phi = g["friction_angle"]
@@ -371,7 +661,6 @@ with st.expander("Full grain properties (from paper)"):
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# ── Drucker-Prager ────────────────────────────────────────────────────────────
 with st.expander("Drucker-Prager 3D yield parameters"):
     st.caption("α = 2·sin(φ) / (√3·(3−sin(φ))),   k = 6·c·cos(φ) / (√3·(3−sin(φ)))")
     dp_rows = []
