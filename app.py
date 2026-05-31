@@ -164,47 +164,80 @@ SIM_HTML = f"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="c" width="720" height="340"></canvas></div>
+<div id="wrap"><canvas id="c"></canvas></div>
 <div class="btns">
   <button class="btn-run" onclick="runSim()">▶ Run simulation</button>
   <button class="btn-reset" onclick="resetSim()">↺ Reset</button>
 </div>
 
 <script>
-const W = 720, H = 340;
+// ── Canvas setup — actual pixel size drives all physics coords ────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const ASPECT = 720 / 340;  // fixed aspect ratio
+
+let W = 720, H = 340;      // logical size — updated on every resize
+
+function resizeCanvas() {{
+  const wrap    = document.getElementById('wrap');
+  const cssW    = wrap.clientWidth  || 720;
+  const cssH    = Math.round(cssW / ASPECT);
+  const dpr     = window.devicePixelRatio || 1;
+
+  // Physical backing pixels
+  canvas.width  = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+
+  // CSS display size
+  canvas.style.width  = cssW  + 'px';
+  canvas.style.height = cssH  + 'px';
+
+  // Scale all canvas drawing to match DPR
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // Update logical dimensions used by physics
+  W = cssW;
+  H = cssH;
+
+  // Rebuild spatial grid whenever dimensions change
+  rebuildGridDims();
+
+  // Invalidate gradient cache (depends on W/H)
+  grainGrad = null;
+}}
+
 const PARTICLE_R = 5;
-const SUBSTEPS = 4;          // sub-steps per frame for stability
+const SUBSTEPS = 4;
 const MAX_PARTICLES = 260;
 
-// Grain properties from paper
 const G = {{
-  frictionAngle: {grain["friction_angle"]},   // degrees
-  cohesion:      {grain["cohesion"]},          // kPa
-  jam:           {grain["jam"]},               // 0-100
+  frictionAngle: {grain["friction_angle"]},
+  cohesion:      {grain["cohesion"]},
+  jam:           {grain["jam"]},
   color:         "{grain["color"]}",
   darkColor:     "{grain["dark_color"]}",
 }};
 
 const SCENE = "{scenario}";
 
-// Derived physics constants
-const phi       = G.frictionAngle * Math.PI / 180;
-const MU        = Math.tan(phi);                      // friction coefficient
-const COH       = G.cohesion * 0.006;                 // cohesion force scale
-const RESTITUTION = Math.max(0.02, 0.18 - MU * 0.14);// bounciness drops with friction
-const DAMP_AIR  = 1.0 - (0.008 + MU * 0.012);        // air damping per frame
-const GRAVITY   = 0.38 / SUBSTEPS;
-const FLOW_RATE = 1.0 - G.jam / 118;
-const NECK_HALF = 16 + (1 - FLOW_RATE) * 26;         // hourglass neck width
+const phi         = G.frictionAngle * Math.PI / 180;
+const MU          = Math.tan(phi);
+const COH         = G.cohesion * 0.006;
+const RESTITUTION = Math.max(0.02, 0.18 - MU * 0.14);
+const DAMP_AIR    = 1.0 - (0.008 + MU * 0.012);
+const GRAVITY     = 0.38 / SUBSTEPS;
+const FLOW_RATE   = 1.0 - G.jam / 118;
+const NECK_HALF   = 16 + (1 - FLOW_RATE) * 26;
 
-const canvas = document.getElementById('c');
-const ctx    = canvas.getContext('2d');
+// ── Spatial hash grid — rebuilt whenever W/H changes ─────────────────────
+const CELL = PARTICLE_R * 2.2;
+let COLS, ROWS, grid;
 
-// ── Spatial hash grid for broadphase collision ────────────────────────────
-const CELL  = PARTICLE_R * 2.2;
-const COLS  = Math.ceil(W / CELL) + 1;
-const ROWS  = Math.ceil(H / CELL) + 1;
-let grid    = new Array(COLS * ROWS);
+function rebuildGridDims() {{
+  COLS = Math.ceil(W / CELL) + 1;
+  ROWS = Math.ceil(H / CELL) + 1;
+  grid = new Array(COLS * ROWS);
+}}
 
 function gridKey(x, y) {{
   return (Math.floor(x / CELL) | 0) + (Math.floor(y / CELL) | 0) * COLS;
@@ -583,8 +616,9 @@ function drawStatic() {{
 // ── Main loop ─────────────────────────────────────────────────────────────
 function runSim() {{
   if (raf) cancelAnimationFrame(raf);
+  resizeCanvas();           // always sync to current rendered size first
   simTime = 0; running = true;
-  grainGrad = null; // reset gradient cache
+  grainGrad = null;
   init();
 
   function loop() {{
@@ -622,15 +656,32 @@ function runSim() {{
 function resetSim() {{
   if (raf) {{ cancelAnimationFrame(raf); raf = null; }}
   running = false;
+  resizeCanvas();
   drawStatic();
 }}
 
+// ── Resize handling ───────────────────────────────────────────────────────
+// ResizeObserver fires whenever the iframe/wrap changes size (incl. fullscreen)
+const ro = new ResizeObserver(() => {{
+  resizeCanvas();
+  if (!running) drawStatic();
+}});
+ro.observe(document.getElementById('wrap'));
+
+// Also catch explicit fullscreen changes
+document.addEventListener('fullscreenchange', () => {{
+  resizeCanvas();
+  if (!running) drawStatic();
+}});
+
+// Initial paint
+resizeCanvas();
 drawStatic();
 </script>
 </body>
 </html>"""
 
-components.html(SIM_HTML, height=420, scrolling=False)
+components.html(SIM_HTML, height=430, scrolling=False)
 
 # ── Yield surface ─────────────────────────────────────────────────────────────
 st.markdown("### Mohr-Coulomb yield surface")
